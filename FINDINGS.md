@@ -2,7 +2,11 @@
 
 ## Executive Summary
 
-The Quarkus reflection-free Jackson serializer generates bytecode at build-time using **JavaBean conventions**, but it has **no awareness of Kotlin** or **jackson-module-kotlin**. This causes two critical issues:
+The Quarkus reflection-free Jackson serializer generates bytecode at build-time using **JavaBean conventions**, but it has **no awareness of Kotlin** or **jackson-module-kotlin**. 
+
+**Critical Issue**: According to [Quarkus Kotlin documentation](https://quarkus.io/guides/kotlin#kotlin-jackson), Quarkus **automatically registers KotlinModule** to the ObjectMapper when `jackson-module-kotlin` is on the classpath. However, this happens at **runtime**, while reflection-free serializers are generated at **build time** - creating a fundamental incompatibility.
+
+This causes two critical issues:
 
 1. **Boolean "is" prefix**: Applies JavaBean rule "strip 'is'" to Kotlin properties, but `jackson-module-kotlin` keeps the actual Kotlin property name
 2. **Duplicate fields**: Processes fields and getters separately, not recognizing that Kotlin properties generate both
@@ -265,15 +269,96 @@ The standard Jackson reflection-based serializers:
 - `KotlinSerializationDetector` - Detect if Kotlin/jackson-module-kotlin is present
 - `KotlinPropertyNamingStrategy` - Handle Kotlin property name conventions
 
-## No Kotlin Awareness
+## No Jackson Module Awareness
 
-The reflection-free serializer code has **zero Kotlin-specific logic**:
-```bash
-$ grep -r "kotlin\|Kotlin" extensions/resteasy-reactive/rest-jackson/deployment/src/main/java/
-# No results
+The reflection-free serializer code has **limited Jackson configuration awareness**:
+
+**What it IS aware of:**
+- ✅ `@JsonNaming` annotation on classes (checks at build time)
+- ✅ `PropertyNamingStrategy` from ObjectMapper (queries at runtime for deserialization)
+
+**What it is NOT aware of:**
+- ❌ Jackson Modules (like `KotlinModule`)
+- ❌ Custom `AnnotationIntrospector` implementations (like `KotlinNamesAnnotationIntrospector`)
+- ❌ Module-specific property naming logic
+- ❌ `ObjectMapperCustomizer` implementations (they run at runtime, after serializers are generated)
+
+**The Fundamental Timing Problem:**
+
+According to [Quarkus Kotlin documentation](https://quarkus.io/guides/kotlin#kotlin-jackson):
+> If the `com.fasterxml.jackson.module:jackson-module-kotlin` dependency and the `quarkus-jackson` extension (or one of the `quarkus-resteasy-jackson` or `quarkus-rest-jackson` extensions) have been added to the project, then **Quarkus automatically registers the KotlinModule** to the ObjectMapper bean.
+
+**How Quarkus registers KotlinModule:**
+1. `KotlinProcessor` (in `quarkus-kotlin` extension) detects `jackson-module-kotlin` on classpath
+2. Produces `ClassPathJacksonModuleBuildItem`
+3. `JacksonProcessor` generates an `ObjectMapperCustomizer` that calls `objectMapper.registerModule(new KotlinModule())`
+4. This customizer runs at **RUNTIME** when ObjectMapper is created
+
+**Why reflection-free serializers break this:**
+1. Reflection-free serializers are generated at **BUILD TIME** (see `ResteasyReactiveJacksonProcessor` line 398-399)
+2. KotlinModule is registered at **RUNTIME**
+3. Generated serializers are hardcoded with JavaBean conventions ("is" stripping)
+4. When KotlinModule is later registered, it's too late - the serializers are already generated and cannot be changed
+
+**Code locations proving this:**
+
+**Build-time generation** (`ResteasyReactiveJacksonProcessor.java` line 398-400):
+```java
+@BuildStep(onlyIf = JacksonOptimizationConfig.IsReflectionFreeSerializersEnabled.class)
+@Record(ExecutionTime.STATIC_INIT)  // ← BUILD TIME
+public void handleEndpointParams(...) {
+    // Generates serializers here
+}
 ```
 
-This is the fundamental issue - the code generator assumes all classes follow JavaBean conventions.
+**Runtime KotlinModule registration** (`KotlinProcessor.java` line 32-39):
+```java
+@BuildStep
+void registerKotlinJacksonModule(BuildProducer<ClassPathJacksonModuleBuildItem> classPathJacksonModules) {
+    if (!QuarkusClassLoader.isClassPresentAtRuntime(KOTLIN_JACKSON_MODULE)) {
+        return;
+    }
+    classPathJacksonModules.produce(new ClassPathJacksonModuleBuildItem(KOTLIN_JACKSON_MODULE));
+    // This gets registered to ObjectMapper at runtime via generated ObjectMapperCustomizer
+}
+```
+
+**Why this matters:**
+`jackson-module-kotlin` works through:
+- `KotlinModule` which registers `KotlinNamesAnnotationIntrospector`
+- `KotlinNamesAnnotationIntrospector` extends `AnnotationIntrospector` (NOT `PropertyNamingStrategy`)
+- Overrides `findImplicitPropertyName()` to return actual Kotlin property names
+
+The reflection-free serializer generates code at **build time** using only:
+- JavaBean conventions (hardcoded "is" stripping in `JacksonCodeGenerator.java` line 588)
+- Annotations directly on classes/fields
+- No runtime module inspection
+- No awareness of what ObjectMapperCustomizers will be applied later
+
+**This violates the documented behavior** - users following the Quarkus Kotlin documentation expect KotlinModule to work automatically, but reflection-free serializers bypass it entirely.
+
+```bash
+$ grep -r "AnnotationIntrospector\|ObjectMapperCustomizer" extensions/resteasy-reactive/rest-jackson/deployment/src/main/java/io/quarkus/resteasy/reactive/jackson/deployment/processor/
+# No results in deployment processor
+```
+
+**Why this matters:**
+`jackson-module-kotlin` works through:
+- `KotlinModule` which registers `KotlinNamesAnnotationIntrospector`
+- `KotlinNamesAnnotationIntrospector` extends `AnnotationIntrospector` (NOT `PropertyNamingStrategy`)
+- Overrides `findImplicitPropertyName()` to return actual Kotlin property names
+
+The reflection-free serializer generates code at **build time** using only:
+- JavaBean conventions (hardcoded "is" stripping)
+- Annotations directly on classes/fields
+- No runtime module inspection
+
+This is the fundamental issue - the code generator assumes all classes follow JavaBean conventions and cannot adapt to module-specific behavior.
+
+```bash
+$ grep -r "AnnotationIntrospector\|Module" extensions/resteasy-reactive/rest-jackson/deployment/src/main/java/
+# No results
+```
 
 ## Timeline
 
