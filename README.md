@@ -2,6 +2,8 @@
 
 This project reproduces two bugs in Quarkus's reflection-free Jackson serializers when used with Kotlin.
 
+**📋 [Detailed Root Cause Analysis →](FINDINGS.md)**
+
 ## The Issues
 
 **Note**: These issues exist in Quarkus 3.36 and possibly earlier versions when the optimization is manually enabled. In Quarkus 3.37, the optimization was enabled **by default**, making these bugs affect all users (commit: 8b303b992c684086abf7db55835270c77dfc0cbd).
@@ -147,6 +149,8 @@ The reflection-free serializers in Quarkus have two critical issues with Kotlin:
 2. Generate duplicate fields when `@JsonProperty` is used to rename properties
 
 Both issues are resolved by disabling reflection-free serializers.
+
+**📋 See [FINDINGS.md](FINDINGS.md) for detailed root cause analysis including Quarkus code locations.**
 
 **Timeline:**
 - These bugs existed in Quarkus 3.36 (and possibly earlier) when the optimization was manually enabled
